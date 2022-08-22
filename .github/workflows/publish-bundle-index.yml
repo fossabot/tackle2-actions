@@ -1,0 +1,88 @@
+name: Publish Tackle 2 Operator Images
+
+on:
+  workflow_call:
+    inputs:
+      registry:
+        required: true
+        type: string
+      bundle_image_name:
+        required: true
+        type: string
+      index_image_name:
+        required: true
+        type: string
+      supported_channels:
+        required: true
+        type: string
+    secrets:
+      QUAY_PUBLISH_ROBOT:
+        required: true
+      QUAY_PUBLISH_TOKEN:
+        required: true
+jobs:
+  bundle-and-index-build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: add checkout action...
+        uses: actions/checkout@v2
+
+      - name: Extract branch name
+        shell: bash
+        run: echo "##[set-output name=branch;]$(echo ${GITHUB_REF#refs/heads/})"
+        id: extract_branch
+
+      - name: Set bundle tags
+        run: |
+             if [ ${{ steps.extract_branch.outputs.branch }} == ${{ github.event.repository.default_branch }} ]; then
+               echo "##[set-output name=tags;]$(echo ${{ inputs.registry }}/${{ inputs.bundle_image_name }}:${{ steps.extract_branch.outputs.branch }},${{ inputs.registry }}/${{ inputs.bundle_image_name }}:latest)"
+             else
+               echo "##[set-output name=tags;]$(echo ${{ inputs.registry }}/${{ inputs.bundle_image_name }}:${{ steps.extract_branch.outputs.branch }})"
+             fi
+        id: set_bundle_tags
+
+      - name: login to Quay.io...
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v1
+        with:
+          registry: ${{ inputs.registry }}
+          username: ${{ secrets.QUAY_PUBLISH_ROBOT }}
+          password: ${{ secrets.QUAY_PUBLISH_TOKEN }}
+
+      - name: build bundle
+        uses: docker/build-push-action@v3
+        with:
+          builder: ${{ steps.docker_buildx.outputs.name }}
+          context: .
+          file: ./bundle.Dockerfile
+          push: true
+          tags: ${{ steps.set_bundle_tags.outputs.tags }}
+
+      - name: Get opm
+        run: wget $(curl -s https://api.github.com/repos/operator-framework/operator-registry/releases/latest | grep 'browser_' | cut -d\" -f4 | grep linux) -O opm && chmod +x opm
+
+      - name: Get latest bundle images
+        run: |
+          git fetch -q origin --unshallow
+          BUNDLES=""
+          for i in $(echo ${{ inputs.supported_channels }} | sed "s/,/ /g"); do
+            BUNDLES=$(echo $BUNDLES,${{ inputs.registry }}/${{ inputs.bundle_image_name }}:$(git branch -r --contains $i | tail -n 1 | cut -d '/' -f 2 ) | sed 's/^,//')
+          done
+          BUNDLES=$BUNDLES,${{ inputs.registry }}/${{ inputs.bundle_image_name }}:latest
+          echo "##[set-output name=bundles]$(echo $BUNDLES | sed 's/^,//')"
+        id: get_bundles
+
+      - name: Run OPM
+        run: ./opm index add -c docker --bundles ${{ steps.get_bundles.outputs.bundles }} --tag ${{ inputs.registry }}/${{ inputs.index_image_name }}:${{ steps.extract_branch.outputs.branch }}
+
+      - name: Push index
+        run: docker push ${{ inputs.registry }}/${{ inputs.index_image_name }}:${{ steps.extract_branch.outputs.branch }}
+
+      - name: Retag and repush index
+        run: |
+             docker tag ${{ inputs.registry }}/${{ inputs.index_image_name }}:${{ steps.extract_branch.outputs.branch }} ${{ inputs.registry }}/${{ inputs.index_image_name }}:latest
+             docker push ${{ inputs.registry }}/${{ inputs.index_image_name }}:latest
+        if: steps.extract_branch.outputs.branch == github.event.repository.default_branch
